@@ -1,8 +1,0 @@
-node_modules/
-release/
-dist/
-music/
-.DS_Store
-*.tsbuildinfo
-*.tgz
-.wrangler
