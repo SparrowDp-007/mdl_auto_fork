@@ -32,7 +32,7 @@ def check_missing() -> list[str]:
     missing = []
     # core/runtime deps
     checks = [
-        ("customtkinter", "customtkinter"),
+        ("PySide6", "PySide6"),
         ("PIL", "Pillow"),
         ("mutagen", "mutagen"),
         ("av", "av"),
@@ -61,7 +61,7 @@ def status_report() -> tuple[list[str], list[str]]:
     installed = []
     missing = []
     checks = [
-        ("customtkinter", "customtkinter"),
+        ("PySide6", "PySide6"),
         ("PIL", "Pillow"),
         ("mutagen", "mutagen"),
         ("av", "av (PyAV)"),
@@ -187,7 +187,7 @@ def install_missing(missing: list[str], log_cb=None) -> bool:
     pkgs = [m for m in missing if not m.startswith("musicdl")]
     # filter out ones that might be satisfied now
     remaining = []
-    modmap = {"Pillow": "PIL", "customtkinter": "customtkinter", "mutagen": "mutagen", "av": "av", "requests": "requests", "numpy": "numpy", "certifi": "certifi"}
+    modmap = {"Pillow": "PIL", "PySide6": "PySide6", "customtkinter": "customtkinter", "mutagen": "mutagen", "av": "av", "requests": "requests", "numpy": "numpy", "certifi": "certifi"}
     for p in pkgs:
         mod = modmap.get(p, p)
         if not _has_module(mod):

@@ -93,6 +93,7 @@ class AppSettings:
     write_report: bool = True
     embed_cover: bool = True
     auto_retry_failed: bool = False
+    auto_retry_missed_on_end: bool = False
     max_retries_per_track: int = 1
     theme: str = "dark"
     language: str = "ru"

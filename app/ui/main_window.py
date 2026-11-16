@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import json
 import os
 import queue
 import shutil
@@ -11,14 +10,13 @@ import threading
 import time
 import webbrowser
 from datetime import datetime
-from tkinter import filedialog, messagebox
 
-import customtkinter as ctk
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..core.config import load_settings, save_settings
 from ..core.manager import DownloadManager
 from ..core.models import AppSettings, ProgressEvent, TaskStatus, TrackTask, norm_text
-from ..core.queue_store import append_tasks, dedupe_tasks, ensure_queue_file, import_csv, read_queue, write_queue
+from ..core.queue_store import append_tasks, ensure_queue_file, import_csv, read_queue, write_queue
 
 README_TEXT = (
     "Формат CSV (UTF-8): колонки Artist,Title,Album,Seconds\n"
@@ -43,175 +41,393 @@ STALL_OPTIONS = {
 }
 
 FORMAT_OPTIONS = ["mp3", "m4a", "flac", "opus", "wav"]
-QUALITY_OPTIONS = {"Лучшее (lossless→цель/320)": "best", "Высокое (320 kbps)": "high", "Среднее (192 kbps)": "medium", "Низкое (128 kbps)": "low", "Своё": "custom"}
+QUALITY_OPTIONS = {
+    "Лучшее (lossless→цель/320)": "best",
+    "Высокое (320 kbps)": "high",
+    "Среднее (192 kbps)": "medium",
+    "Низкое (128 kbps)": "low",
+    "Своё": "custom",
+}
 ALL_SOURCES = ["NeteaseMusicClient", "KuwoMusicClient", "BilibiliMusicClient", "YouTubeMusicClient"]
 
+DARK_QSS = """
+QWidget { background-color: #1e1e1e; color: #e6e6e6; font-size: 13px; }
+QMainWindow, QDialog { background-color: #1e1e1e; }
+QGroupBox { border: 1px solid #3a3a3a; border-radius: 6px; margin-top: 8px; padding-top: 8px; font-weight: bold; }
+QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; color: #d0d0d0; }
+QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QSpinBox { background-color: #2b2b2b; border: 1px solid #444; border-radius: 4px; padding: 4px; selection-background-color: #3a6ea5; }
+QLineEdit:read-only { color: #b8b8b8; }
+QPushButton { background-color: #3a3a3a; border: 1px solid #555; border-radius: 4px; padding: 6px 10px; }
+QPushButton:hover { background-color: #4a4a4a; }
+QPushButton:pressed { background-color: #2f2f2f; }
+QPushButton#startBtn { background-color: #2d7d46; border: 1px solid #25663a; }
+QPushButton#startBtn:hover { background-color: #25663a; }
+QPushButton#stopBtn { background-color: #8b2e2e; border: 1px solid #6f2424; }
+QPushButton#stopBtn:hover { background-color: #6f2424; }
+QPushButton#accentBtn { background-color: #5a4b8a; border: 1px solid #483c70; }
+QPushButton#accentBtn:hover { background-color: #483c70; }
+QProgressBar { border: 1px solid #444; border-radius: 4px; text-align: center; background-color: #2b2b2b; height: 16px; }
+QProgressBar::chunk { background-color: #3a6ea5; border-radius: 3px; }
+QLabel { background: transparent; }
+QCheckBox { spacing: 6px; }
+QScrollBar:vertical { background: #252525; width: 12px; margin: 0; }
+QScrollBar::handle:vertical { background: #555; min-height: 20px; border-radius: 4px; }
+QScrollBar::handle:vertical:hover { background: #666; }
+QComboBox QAbstractItemView { background-color: #2b2b2b; selection-background-color: #3a6ea5; }
+"""
 
-class App(ctk.CTk):
+
+def open_path(path: str):
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception:
+        try:
+            webbrowser.open(path)
+        except Exception:
+            pass
+
+
+class SourcesDialog(QtWidgets.QDialog):
+    def __init__(self, parent, selected):
+        super().__init__(parent)
+        self.setWindowTitle("Источники поиска")
+        self.resize(420, 300)
+        self.selected = list(selected)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.checks = {}
+        cur = set(selected or ALL_SOURCES)
+        for s in ALL_SOURCES:
+            cb = QtWidgets.QCheckBox(s)
+            cb.setChecked(s in cur)
+            layout.addWidget(cb)
+            self.checks[s] = cb
+        layout.addStretch(1)
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        ok = QtWidgets.QPushButton("Сохранить")
+        ok.clicked.connect(self._save)
+        btns.addWidget(ok)
+        layout.addLayout(btns)
+
+    def _save(self):
+        sel = [s for s in ALL_SOURCES if self.checks[s].isChecked()]
+        if not sel:
+            QtWidgets.QMessageBox.warning(self, "Источники", "Нужен хотя бы один источник")
+            return
+        self.selected = sel
+        self.accept()
+
+
+class SettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent, settings: AppSettings):
+        super().__init__(parent)
+        self.setWindowTitle("Настройки")
+        self.resize(520, 420)
+        self.settings = settings
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        self.w_spin = QtWidgets.QSpinBox()
+        self.w_spin.setRange(1, 6)
+        self.w_spin.setValue(int(settings.workers or 3))
+        self.t_spin = QtWidgets.QSpinBox()
+        self.t_spin.setRange(20, 600)
+        self.t_spin.setValue(int(settings.search_timeout_s or 80))
+        self.try_spin = QtWidgets.QSpinBox()
+        self.try_spin.setRange(1, 8)
+        self.try_spin.setValue(int(settings.try_candidates or 3))
+        self.br_spin = QtWidgets.QSpinBox()
+        self.br_spin.setRange(64, 320)
+        self.br_spin.setSingleStep(32)
+        self.br_spin.setValue(int(settings.custom_bitrate_kbps or 320))
+        form.addRow("Параллельных воркеров (1-6)", self.w_spin)
+        form.addRow("Таймаут поиска, сек", self.t_spin)
+        form.addRow("Кандидатов пробовать на трек", self.try_spin)
+        form.addRow("Свой битрейт (kbps) для custom", self.br_spin)
+        layout.addLayout(form)
+        self.skip_cb = QtWidgets.QCheckBox("Пропускать уже существующие файлы")
+        self.skip_cb.setChecked(bool(settings.skip_existing))
+        self.m3u_cb = QtWidgets.QCheckBox("Писать M3U плейлист")
+        self.m3u_cb.setChecked(bool(settings.write_m3u))
+        self.rep_cb = QtWidgets.QCheckBox("Писать CSV отчёт")
+        self.rep_cb.setChecked(bool(settings.write_report))
+        self.auto_retry_end_cb = QtWidgets.QCheckBox("По завершении списка: повторить failed/miss и запустить снова")
+        self.auto_retry_end_cb.setChecked(bool(getattr(settings, "auto_retry_missed_on_end", False)))
+        layout.addWidget(self.skip_cb)
+        layout.addWidget(self.m3u_cb)
+        layout.addWidget(self.rep_cb)
+        layout.addWidget(self.auto_retry_end_cb)
+        layout.addStretch(1)
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        ok = QtWidgets.QPushButton("Сохранить")
+        ok.clicked.connect(self._save)
+        btns.addWidget(ok)
+        layout.addLayout(btns)
+
+    def _save(self):
+        self.settings.workers = int(self.w_spin.value())
+        self.settings.search_timeout_s = int(self.t_spin.value())
+        self.settings.try_candidates = int(self.try_spin.value())
+        self.settings.custom_bitrate_kbps = int(self.br_spin.value())
+        self.settings.skip_existing = bool(self.skip_cb.isChecked())
+        self.settings.write_m3u = bool(self.m3u_cb.isChecked())
+        self.settings.write_report = bool(self.rep_cb.isChecked())
+        self.settings.auto_retry_missed_on_end = bool(self.auto_retry_end_cb.isChecked())
+        self.accept()
+
+
+class ReadmeDialog(QtWidgets.QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Формат списка (README)")
+        self.resize(640, 420)
+        layout = QtWidgets.QVBoxLayout(self)
+        tb = QtWidgets.QPlainTextEdit()
+        tb.setPlainText(README_TEXT)
+        tb.setReadOnly(True)
+        layout.addWidget(tb)
+
+
+class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = load_settings()
-        self.title("MusicDL Fork")
-        self.geometry("1480x860")
-        self.minsize(1280, 720)
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
+        self.setWindowTitle("MusicDL Fork")
+        self.resize(1480, 860)
+        self.setMinimumSize(1280, 720)
 
-        self.ui_queue = queue.Queue()
+        self.ui_queue: queue.Queue = queue.Queue()
         self.manager = DownloadManager(self.settings, sink=self._on_manager_event)
         self._last_success_ts: float = 0.0
         self._last_success_name: str = ""
+        self._starting = False
+        self._last_queue_reorder_ts = 0.0
 
         self._build_ui()
         self._load_initial_queue()
-        self.after(200, self._poll_ui_queue)
-        self.after(1000, self._tick_status)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.poll_timer = QtCore.QTimer(self)
+        self.poll_timer.timeout.connect(self._poll_ui_queue)
+        self.poll_timer.start(150)
+        self.tick_timer = QtCore.QTimer(self)
+        self.tick_timer.timeout.connect(self._tick_status)
+        self.tick_timer.start(1000)
 
     # ---------------- UI build
     def _build_ui(self):
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        root = QtWidgets.QVBoxLayout(central)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
 
         # top controls
-        top = ctk.CTkFrame(self, corner_radius=10)
-        top.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
-        top.grid_columnconfigure(1, weight=1)
+        top = QtWidgets.QFrame()
+        top_l = QtWidgets.QGridLayout(top)
+        top_l.setContentsMargins(8, 8, 8, 8)
+        top_l.setHorizontalSpacing(6)
+        top_l.setColumnStretch(1, 1)
 
-        # output folder
-        ctk.CTkLabel(top, text="Папка сохранения:").grid(row=0, column=0, padx=8, pady=6, sticky="w")
-        self.out_var = ctk.StringVar(value=self.settings.output_dir)
-        ctk.CTkEntry(top, textvariable=self.out_var, width=420).grid(row=0, column=1, padx=4, pady=6, sticky="ew")
-        ctk.CTkButton(top, text="Выбрать...", width=100, command=self._choose_out).grid(row=0, column=2, padx=4, pady=6)
-        ctk.CTkButton(top, text="Открыть папку", width=120, command=self._open_out_folder).grid(row=0, column=3, padx=4, pady=6)
+        top_l.addWidget(QtWidgets.QLabel("Папка сохранения:"), 0, 0)
+        self.out_edit = QtWidgets.QLineEdit(self.settings.output_dir)
+        top_l.addWidget(self.out_edit, 0, 1)
+        b_out = QtWidgets.QPushButton("Выбрать...")
+        b_out.clicked.connect(self._choose_out)
+        top_l.addWidget(b_out, 0, 2)
+        b_open = QtWidgets.QPushButton("Открыть папку")
+        b_open.clicked.connect(self._open_out_folder)
+        top_l.addWidget(b_open, 0, 3)
 
-        # format/quality
-        ctk.CTkLabel(top, text="Формат:").grid(row=0, column=4, padx=(12,4), pady=6)
-        self.format_var = ctk.StringVar(value=self.settings.target_format if self.settings.target_format in FORMAT_OPTIONS else "mp3")
-        ctk.CTkOptionMenu(top, values=FORMAT_OPTIONS, variable=self.format_var, width=90).grid(row=0, column=5, padx=4, pady=6)
-        ctk.CTkLabel(top, text="Качество:").grid(row=0, column=6, padx=(12,4), pady=6)
-        q_rev = {v:k for k,v in QUALITY_OPTIONS.items()}
-        self.quality_var = ctk.StringVar(value=q_rev.get(self.settings.quality_mode, "Высокое (320 kbps)"))
-        ctk.CTkOptionMenu(top, values=list(QUALITY_OPTIONS.keys()), variable=self.quality_var, width=220).grid(row=0, column=7, padx=4, pady=6)
+        top_l.addWidget(QtWidgets.QLabel("Формат:"), 0, 4)
+        self.format_combo = QtWidgets.QComboBox()
+        self.format_combo.addItems(FORMAT_OPTIONS)
+        if self.settings.target_format in FORMAT_OPTIONS:
+            self.format_combo.setCurrentText(self.settings.target_format)
+        top_l.addWidget(self.format_combo, 0, 5)
+        top_l.addWidget(QtWidgets.QLabel("Качество:"), 0, 6)
+        self.quality_combo = QtWidgets.QComboBox()
+        self.quality_combo.addItems(list(QUALITY_OPTIONS.keys()))
+        q_rev = {v: k for k, v in QUALITY_OPTIONS.items()}
+        self.quality_combo.setCurrentText(q_rev.get(self.settings.quality_mode, "Высокое (320 kbps)"))
+        self.quality_combo.setMinimumWidth(220)
+        top_l.addWidget(self.quality_combo, 0, 7)
 
-        # row1: queue file + stall + sources
-        ctk.CTkLabel(top, text="Файл очереди (активный):").grid(row=1, column=0, padx=8, pady=6, sticky="w")
-        self.queue_var = ctk.StringVar(value=self.settings.queue_file)
-        ctk.CTkEntry(top, textvariable=self.queue_var, state="readonly").grid(row=1, column=1, padx=4, pady=6, sticky="ew")
-        ctk.CTkButton(top, text="Выбрать...", width=110, command=self._choose_queue_file).grid(row=1, column=2, padx=4, pady=6)
-        ctk.CTkButton(top, text="Формат (README)", width=140, command=self._show_readme).grid(row=1, column=3, padx=4, pady=6)
+        top_l.addWidget(QtWidgets.QLabel("Файл очереди (активный):"), 1, 0)
+        self.queue_edit = QtWidgets.QLineEdit(self.settings.queue_file)
+        self.queue_edit.setReadOnly(True)
+        top_l.addWidget(self.queue_edit, 1, 1)
+        b_q = QtWidgets.QPushButton("Выбрать...")
+        b_q.clicked.connect(self._choose_queue_file)
+        top_l.addWidget(b_q, 1, 2)
+        b_fmt = QtWidgets.QPushButton("Формат (README)")
+        b_fmt.clicked.connect(self._show_readme)
+        top_l.addWidget(b_fmt, 1, 3)
 
-        ctk.CTkLabel(top, text="Рестарт при простое:").grid(row=1, column=4, padx=(12,4), pady=6)
-        stall_rev = {v:k for k,v in STALL_OPTIONS.items()}
-        self.stall_var = ctk.StringVar(value=stall_rev.get(int(self.settings.stall_restart_minutes), "20 минут"))
-        ctk.CTkOptionMenu(top, values=list(STALL_OPTIONS.keys()), variable=self.stall_var, width=140).grid(row=1, column=5, padx=4, pady=6)
-        ctk.CTkButton(top, text="Источники...", width=110, command=self._sources_dialog).grid(row=1, column=6, padx=4, pady=6)
-        ctk.CTkButton(top, text="Настройки", width=100, command=self._settings_dialog).grid(row=1, column=7, padx=4, pady=6)
+        top_l.addWidget(QtWidgets.QLabel("Рестарт при простое:"), 1, 4)
+        self.stall_combo = QtWidgets.QComboBox()
+        self.stall_combo.addItems(list(STALL_OPTIONS.keys()))
+        stall_rev = {v: k for k, v in STALL_OPTIONS.items()}
+        self.stall_combo.setCurrentText(stall_rev.get(int(self.settings.stall_restart_minutes), "20 минут"))
+        top_l.addWidget(self.stall_combo, 1, 5)
+        b_src = QtWidgets.QPushButton("Источники...")
+        b_src.clicked.connect(self._sources_dialog)
+        top_l.addWidget(b_src, 1, 6)
+        b_set = QtWidgets.QPushButton("Настройки")
+        b_set.clicked.connect(self._settings_dialog)
+        top_l.addWidget(b_set, 1, 7)
+        root.addWidget(top)
 
         # main split
-        mid = ctk.CTkFrame(self, corner_radius=10)
-        mid.grid(row=1, column=0, sticky="nsew", padx=10, pady=6)
-        mid.grid_columnconfigure(0, weight=3)
-        mid.grid_columnconfigure(1, weight=2)
-        mid.grid_rowconfigure(1, weight=1)
+        mid = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        root.addWidget(mid, 1)
 
-        # left: queue + progress
-        left = ctk.CTkFrame(mid)
-        left.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(6,4), pady=6)
-        left.grid_columnconfigure(0, weight=1)
-        left.grid_rowconfigure(2, weight=1)
+        # left panel
+        left = QtWidgets.QWidget()
+        left_l = QtWidgets.QVBoxLayout(left)
+        left_l.setContentsMargins(4, 4, 4, 4)
+        left_l.setSpacing(6)
 
-        prog = ctk.CTkFrame(left)
-        prog.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
-        prog.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(prog, text="Общий прогресс:").grid(row=0, column=0, padx=6, pady=(6,2), sticky="w")
-        self.overall_bar = ctk.CTkProgressBar(prog)
-        self.overall_bar.grid(row=0, column=1, padx=6, pady=(6,2), sticky="ew")
-        self.overall_bar.set(0)
-        self.overall_label = ctk.CTkLabel(prog, text="0 / 0")
-        self.overall_label.grid(row=0, column=2, padx=6, pady=(6,2))
+        prog_box = QtWidgets.QFrame()
+        prog_l = QtWidgets.QGridLayout(prog_box)
+        prog_l.setContentsMargins(6, 6, 6, 6)
+        prog_l.addWidget(QtWidgets.QLabel("Общий прогресс:"), 0, 0)
+        self.overall_bar = QtWidgets.QProgressBar()
+        self.overall_bar.setRange(0, 1000)
+        self.overall_bar.setValue(0)
+        self.overall_bar.setTextVisible(False)
+        prog_l.addWidget(self.overall_bar, 0, 1)
+        self.overall_label = QtWidgets.QLabel("0 / 0")
+        prog_l.addWidget(self.overall_label, 0, 2)
+        prog_l.setColumnStretch(1, 1)
 
-        self.workers_frame = ctk.CTkFrame(prog, fg_color="transparent")
-        self.workers_frame.grid(row=1, column=0, columnspan=3, padx=6, pady=(2,6), sticky="ew")
-        self.workers_frame.grid_columnconfigure(1, weight=1)
+        self.workers_frame = QtWidgets.QFrame()
+        self.workers_layout = QtWidgets.QGridLayout(self.workers_frame)
+        self.workers_layout.setContentsMargins(0, 4, 0, 0)
+        self.workers_layout.setColumnStretch(1, 1)
+        prog_l.addWidget(self.workers_frame, 1, 0, 1, 3)
         self.worker_labels = {}
         self.worker_bars = {}
         self.worker_pcts = {}
         self._ensure_worker_labels(1)
+        left_l.addWidget(prog_box)
 
-        # queue actions
-        qa = ctk.CTkFrame(left)
-        qa.grid(row=1, column=0, sticky="ew", padx=6, pady=4)
-        ctk.CTkButton(qa, text="Старт", width=90, fg_color="#2d7d46", hover_color="#25663a", command=self._start).pack(side="left", padx=3, pady=4)
-        ctk.CTkButton(qa, text="Пауза", width=90, command=self._pause).pack(side="left", padx=3, pady=4)
-        ctk.CTkButton(qa, text="Продолжить", width=100, command=self._resume).pack(side="left", padx=3, pady=4)
-        ctk.CTkButton(qa, text="Стоп", width=90, fg_color="#8b2e2e", hover_color="#6f2424", command=self._stop).pack(side="left", padx=3, pady=4)
-        ctk.CTkButton(qa, text="Повторить failed/miss", width=170, command=self._retry_failed).pack(side="left", padx=8, pady=4)
-        ctk.CTkButton(qa, text="Экспорт отчёта/M3U", width=160, command=self._export_report).pack(side="left", padx=3, pady=4)
+        qa = QtWidgets.QFrame()
+        qa_l = QtWidgets.QHBoxLayout(qa)
+        qa_l.setContentsMargins(4, 2, 4, 2)
+        b_start = QtWidgets.QPushButton("Старт")
+        b_start.setObjectName("startBtn")
+        b_start.clicked.connect(self._start)
+        b_pause = QtWidgets.QPushButton("Пауза")
+        b_pause.clicked.connect(self._pause)
+        b_resume = QtWidgets.QPushButton("Продолжить")
+        b_resume.clicked.connect(self._resume)
+        b_stop = QtWidgets.QPushButton("Стоп")
+        b_stop.setObjectName("stopBtn")
+        b_stop.clicked.connect(self._stop)
+        b_retry = QtWidgets.QPushButton("Повторить failed/miss")
+        b_retry.clicked.connect(self._retry_failed)
+        b_export = QtWidgets.QPushButton("Экспорт отчёта/M3U")
+        b_export.clicked.connect(self._export_report)
+        for b in (b_start, b_pause, b_resume, b_stop):
+            qa_l.addWidget(b)
+        qa_l.addSpacing(8)
+        qa_l.addWidget(b_retry)
+        qa_l.addWidget(b_export)
+        qa_l.addStretch(1)
+        left_l.addWidget(qa)
 
-        # queue list (lightweight text view)
-        qf = ctk.CTkFrame(left)
-        qf.grid(row=2, column=0, sticky="nsew", padx=6, pady=6)
-        qf.grid_rowconfigure(1, weight=1)
-        qf.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(qf, text="Очередь (активные сверху)", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w", padx=6, pady=(6,2))
-        self.queue_text = ctk.CTkTextbox(qf, wrap="none")
-        self.queue_text.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
-        try:
-            self.queue_text.configure(state="disabled")
-        except Exception:
-            pass
+        q_group = QtWidgets.QGroupBox("Очередь (активные сверху)")
+        q_l = QtWidgets.QVBoxLayout(q_group)
+        self.queue_text = QtWidgets.QPlainTextEdit()
+        self.queue_text.setReadOnly(True)
+        self.queue_text.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        mono = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        mono.setPointSize(10)
+        self.queue_text.setFont(mono)
+        q_l.addWidget(self.queue_text)
+        left_l.addWidget(q_group, 1)
+        mid.addWidget(left)
 
-        # right: add/find/log/info
-        right = ctk.CTkFrame(mid)
-        right.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(4,6), pady=6)
-        right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(3, weight=1)
+        # right panel
+        right = QtWidgets.QWidget()
+        right_l = QtWidgets.QVBoxLayout(right)
+        right_l.setContentsMargins(4, 4, 4, 4)
+        right_l.setSpacing(6)
 
-        addf = ctk.CTkFrame(right)
-        addf.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
-        addf.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(addf, text="Добавить трек в очередь", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, columnspan=2, padx=6, pady=(6,4), sticky="w")
-        self.e_artist = ctk.CTkEntry(addf, placeholder_text="Artist")
-        self.e_title = ctk.CTkEntry(addf, placeholder_text="Title")
-        self.e_album = ctk.CTkEntry(addf, placeholder_text="Album")
-        self.e_secs = ctk.CTkEntry(addf, placeholder_text="Seconds", width=100)
-        ctk.CTkLabel(addf, text="Artist").grid(row=1, column=0, padx=6, pady=3, sticky="w"); self.e_artist.grid(row=1, column=1, padx=6, pady=3, sticky="ew")
-        ctk.CTkLabel(addf, text="Title").grid(row=2, column=0, padx=6, pady=3, sticky="w"); self.e_title.grid(row=2, column=1, padx=6, pady=3, sticky="ew")
-        ctk.CTkLabel(addf, text="Album").grid(row=3, column=0, padx=6, pady=3, sticky="w"); self.e_album.grid(row=3, column=1, padx=6, pady=3, sticky="ew")
-        ctk.CTkLabel(addf, text="Seconds").grid(row=4, column=0, padx=6, pady=3, sticky="w"); self.e_secs.grid(row=4, column=1, padx=6, pady=3, sticky="w")
-        abtn = ctk.CTkFrame(addf, fg_color="transparent")
-        abtn.grid(row=5, column=0, columnspan=2, sticky="ew", padx=4, pady=4)
-        ctk.CTkButton(abtn, text="Добавить в конец очереди", command=self._add_to_queue).pack(side="left", padx=4)
-        ctk.CTkButton(abtn, text="Найти сейчас (приоритет)", fg_color="#5a4b8a", hover_color="#483c70", command=lambda: self._find_now(single=False)).pack(side="left", padx=4)
-        ctk.CTkButton(abtn, text="Найти только этот трек", fg_color="#5a4b8a", hover_color="#483c70", command=lambda: self._find_now(single=True)).pack(side="left", padx=4)
+        add_group = QtWidgets.QGroupBox("Добавить трек в очередь")
+        add_l = QtWidgets.QGridLayout(add_group)
+        self.e_artist = QtWidgets.QLineEdit()
+        self.e_artist.setPlaceholderText("Artist")
+        self.e_title = QtWidgets.QLineEdit()
+        self.e_title.setPlaceholderText("Title")
+        self.e_album = QtWidgets.QLineEdit()
+        self.e_album.setPlaceholderText("Album")
+        self.e_secs = QtWidgets.QLineEdit()
+        self.e_secs.setPlaceholderText("Seconds")
+        self.e_secs.setMaximumWidth(120)
+        add_l.addWidget(QtWidgets.QLabel("Artist"), 0, 0)
+        add_l.addWidget(self.e_artist, 0, 1)
+        add_l.addWidget(QtWidgets.QLabel("Title"), 1, 0)
+        add_l.addWidget(self.e_title, 1, 1)
+        add_l.addWidget(QtWidgets.QLabel("Album"), 2, 0)
+        add_l.addWidget(self.e_album, 2, 1)
+        add_l.addWidget(QtWidgets.QLabel("Seconds"), 3, 0)
+        add_l.addWidget(self.e_secs, 3, 1)
+        abtn_w = QtWidgets.QWidget()
+        abtn_l = QtWidgets.QHBoxLayout(abtn_w)
+        abtn_l.setContentsMargins(0, 4, 0, 0)
+        b_add = QtWidgets.QPushButton("Добавить в конец очереди")
+        b_add.clicked.connect(self._add_to_queue)
+        b_pri = QtWidgets.QPushButton("Найти сейчас (приоритет)")
+        b_pri.setObjectName("accentBtn")
+        b_pri.clicked.connect(lambda: self._find_now(single=False))
+        b_one = QtWidgets.QPushButton("Найти только этот трек")
+        b_one.setObjectName("accentBtn")
+        b_one.clicked.connect(lambda: self._find_now(single=True))
+        abtn_l.addWidget(b_add)
+        abtn_l.addWidget(b_pri)
+        abtn_l.addWidget(b_one)
+        abtn_l.addStretch(1)
+        add_l.addWidget(abtn_w, 4, 0, 1, 2)
+        right_l.addWidget(add_group)
 
-        tools = ctk.CTkFrame(right)
-        tools.grid(row=1, column=0, sticky="ew", padx=6, pady=6)
-        ctk.CTkLabel(tools, text="Инструменты", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, columnspan=2, padx=6, pady=(6,4), sticky="w")
-        ctk.CTkButton(tools, text="Открыть лог", command=self._open_log).grid(row=1, column=0, padx=6, pady=6, sticky="ew")
-        ctk.CTkButton(tools, text="Импорт CSV (с дедупликацией)", command=self._import_csv).grid(row=1, column=1, padx=6, pady=6, sticky="ew")
-        tools.grid_columnconfigure((0,1), weight=1)
+        tools_group = QtWidgets.QGroupBox("Инструменты")
+        tools_l = QtWidgets.QGridLayout(tools_group)
+        b_log = QtWidgets.QPushButton("Открыть лог")
+        b_log.clicked.connect(self._open_log)
+        b_imp = QtWidgets.QPushButton("Импорт CSV (с дедупликацией)")
+        b_imp.clicked.connect(self._import_csv)
+        tools_l.addWidget(b_log, 0, 0)
+        tools_l.addWidget(b_imp, 0, 1)
+        tools_l.setColumnStretch(0, 1)
+        tools_l.setColumnStretch(1, 1)
+        right_l.addWidget(tools_group)
 
-        info = ctk.CTkFrame(right)
-        info.grid(row=2, column=0, sticky="ew", padx=6, pady=6)
-        info.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(info, text="Последнее успешное скачивание (OK):").grid(row=0, column=0, padx=6, pady=4, sticky="w")
-        self.last_dl_label = ctk.CTkLabel(info, text="—")
-        self.last_dl_label.grid(row=0, column=1, padx=6, pady=4, sticky="w")
-        ctk.CTkLabel(info, text="Свободно на диске:").grid(row=1, column=0, padx=6, pady=4, sticky="w")
-        self.disk_label = ctk.CTkLabel(info, text="—")
-        self.disk_label.grid(row=1, column=1, padx=6, pady=4, sticky="w")
+        info_group = QtWidgets.QGroupBox("")
+        info_l = QtWidgets.QGridLayout(info_group)
+        info_l.addWidget(QtWidgets.QLabel("Последнее успешное скачивание (OK):"), 0, 0)
+        self.last_dl_label = QtWidgets.QLabel("—")
+        info_l.addWidget(self.last_dl_label, 0, 1)
+        info_l.addWidget(QtWidgets.QLabel("Свободно на диске:"), 1, 0)
+        self.disk_label = QtWidgets.QLabel("—")
+        info_l.addWidget(self.disk_label, 1, 1)
+        info_l.setColumnStretch(1, 1)
+        right_l.addWidget(info_group)
 
-        logf = ctk.CTkFrame(right)
-        logf.grid(row=3, column=0, sticky="nsew", padx=6, pady=6)
-        logf.grid_rowconfigure(1, weight=1)
-        logf.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(logf, text="Журнал / статус", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=6, pady=(6,4), sticky="w")
-        self.log_text = ctk.CTkTextbox(logf, wrap="word")
-        self.log_text.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
-
-        self.selected_uid: str | None = None
+        log_group = QtWidgets.QGroupBox("Журнал / статус")
+        log_l = QtWidgets.QVBoxLayout(log_group)
+        self.log_text = QtWidgets.QPlainTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumBlockCount(5000)
+        log_l.addWidget(self.log_text)
+        right_l.addWidget(log_group, 1)
+        mid.addWidget(right)
+        mid.setSizes([850, 620])
 
     # ---------------- helpers
     def _ensure_worker_labels(self, count: int):
@@ -219,23 +435,26 @@ class App(ctk.CTk):
             count = max(1, min(int(count or 1), 6))
         except Exception:
             count = 1
-        # rebuild labels and per-worker progress bars
-        for w in self.workers_frame.winfo_children():
-            try:
-                w.destroy()
-            except Exception:
-                pass
+        for i in reversed(range(self.workers_layout.count())):
+            item = self.workers_layout.takeAt(i)
+            w = item.widget()
+            if w:
+                w.deleteLater()
         self.worker_labels = {}
         self.worker_bars = {}
         self.worker_pcts = {}
         for i in range(count):
-            lbl = ctk.CTkLabel(self.workers_frame, text=f"Воркер {i+1}: ожидание", anchor="w")
-            lbl.grid(row=i, column=0, sticky="w", padx=2, pady=1)
-            bar = ctk.CTkProgressBar(self.workers_frame)
-            bar.grid(row=i, column=1, sticky="ew", padx=6, pady=1)
-            bar.set(0)
-            pct = ctk.CTkLabel(self.workers_frame, text="0%", width=42)
-            pct.grid(row=i, column=2, sticky="e", padx=2, pady=1)
+            lbl = QtWidgets.QLabel(f"Воркер {i+1}: ожидание")
+            bar = QtWidgets.QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setTextVisible(False)
+            pct = QtWidgets.QLabel("0%")
+            pct.setFixedWidth(42)
+            pct.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            self.workers_layout.addWidget(lbl, i, 0)
+            self.workers_layout.addWidget(bar, i, 1)
+            self.workers_layout.addWidget(pct, i, 2)
             self.worker_labels[i] = lbl
             self.worker_bars[i] = bar
             self.worker_pcts[i] = pct
@@ -246,32 +465,28 @@ class App(ctk.CTk):
         except Exception:
             return
         if wid not in self.worker_labels:
-            # expand if needed
             self._ensure_worker_labels(max(len(self.worker_labels), wid + 1))
         lbl = self.worker_labels.get(wid)
         if lbl:
-            try:
-                lbl.configure(text=f"Воркер {wid+1}: {text}")
-            except Exception:
-                pass
+            lbl.setText(f"Воркер {wid+1}: {text}")
         if progress is not None:
             try:
                 p = max(0.0, min(1.0, float(progress)))
                 bar = self.worker_bars.get(wid)
                 pct = self.worker_pcts.get(wid)
                 if bar:
-                    bar.set(p)
+                    bar.setValue(int(p * 100))
                 if pct:
-                    pct.configure(text=f"{int(p*100)}%")
+                    pct.setText(f"{int(p*100)}%")
             except Exception:
                 pass
 
     def _apply_settings_from_ui(self):
-        self.settings.output_dir = self.out_var.get().strip() or self.settings.output_dir
-        self.settings.queue_file = self.queue_var.get().strip() or self.settings.queue_file
-        self.settings.target_format = self.format_var.get()
-        self.settings.quality_mode = QUALITY_OPTIONS.get(self.quality_var.get(), "high")
-        self.settings.stall_restart_minutes = STALL_OPTIONS.get(self.stall_var.get(), 20)
+        self.settings.output_dir = self.out_edit.text().strip() or self.settings.output_dir
+        self.settings.queue_file = self.queue_edit.text().strip() or self.settings.queue_file
+        self.settings.target_format = self.format_combo.currentText()
+        self.settings.quality_mode = QUALITY_OPTIONS.get(self.quality_combo.currentText(), "high")
+        self.settings.stall_restart_minutes = STALL_OPTIONS.get(self.stall_combo.currentText(), 20)
         os.makedirs(self.settings.output_dir, exist_ok=True)
         ensure_queue_file(self.settings.queue_file)
         self.manager.settings = self.settings
@@ -279,8 +494,7 @@ class App(ctk.CTk):
 
     def _append_log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert("end", f"[{ts}] {msg}\n")
-        self.log_text.see("end")
+        self.log_text.appendPlainText(f"[{ts}] {msg}")
 
     def _load_initial_queue(self):
         ensure_queue_file(self.settings.queue_file)
@@ -288,7 +502,6 @@ class App(ctk.CTk):
         self._refresh_queue_view()
 
     def _queue_sort_key(self, t: "TrackTask"):
-        # active/processing tracks first so "сейчас ищутся/качаются" are on top
         active = {TaskStatus.SEARCHING, TaskStatus.SELECTING, TaskStatus.DOWNLOADING, TaskStatus.CONVERTING, TaskStatus.TAGGING}
         if t.status in active:
             return (0, t.status.value)
@@ -298,7 +511,6 @@ class App(ctk.CTk):
             return (2, 0)
         if t.status in (TaskStatus.FAILED, TaskStatus.MISS):
             return (3, 0)
-        # ok/skipped/canceled last
         return (4, 0)
 
     def _queue_line(self, idx: int, t: "TrackTask") -> str:
@@ -312,14 +524,6 @@ class App(ctk.CTk):
         return f"{idx:>4}. {st}  {name}{extra}"
 
     def _refresh_queue_view(self):
-        # lightweight text render (replaces heavy per-row widgets)
-        job = getattr(self, "_queue_render_job", None)
-        if job:
-            try:
-                self.after_cancel(job)
-            except Exception:
-                pass
-            self._queue_render_job = None
         with self.manager._lock:
             tasks = list(self.manager.tasks)
         try:
@@ -327,9 +531,9 @@ class App(ctk.CTk):
         except Exception:
             pass
         self._queue_tasks_snapshot = tasks
-        self.overall_label.configure(text=f"{self.manager._done_count} / {len(tasks)}")
+        self.overall_label.setText(f"{self.manager._done_count} / {len(tasks)}")
         total = max(1, len(tasks))
-        self.overall_bar.set(self.manager._done_count / total)
+        self.overall_bar.setValue(int(1000 * self.manager._done_count / total))
         lines = []
         limit = min(len(tasks), 2000)
         for i, t in enumerate(tasks[:limit], 1):
@@ -340,21 +544,8 @@ class App(ctk.CTk):
         if len(tasks) > limit:
             lines.append(f"... и ещё {len(tasks) - limit} треков (всего {len(tasks)})")
         text = "\n".join(lines) if lines else "Очередь пуста."
-        try:
-            self.queue_text.configure(state="normal")
-            self.queue_text.delete("1.0", "end")
-            self.queue_text.insert("1.0", text)
-            self.queue_text.configure(state="disabled")
-        except Exception:
-            pass
+        self.queue_text.setPlainText(text)
         self._last_queue_reorder_ts = time.time()
-
-    def _render_queue_chunk(self, batch: int = 20):
-        # compatibility no-op: rendering is now single-pass lightweight text
-        self._queue_render_job = None
-
-    def _select(self, uid: str):
-        self.selected_uid = uid
 
     def _tick_status(self):
         try:
@@ -362,19 +553,20 @@ class App(ctk.CTk):
             if ts and ts > 0:
                 tstr = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
                 name = getattr(self, "_last_success_name", "") or ""
-                self.last_dl_label.configure(text=(f"{tstr}  —  {name}" if name else tstr))
+                self.last_dl_label.setText(f"{tstr}  —  {name}" if name else tstr)
             else:
-                self.last_dl_label.configure(text="—")
-            out = self.out_var.get().strip() or self.settings.output_dir
-            if out and os.path.exists(os.path.splitdrive(out)[0] + os.sep or out):
+                self.last_dl_label.setText("—")
+            out = self.out_edit.text().strip() or self.settings.output_dir
+            if out:
                 try:
-                    usage = shutil.disk_usage(out if os.path.exists(out) else os.path.splitdrive(out)[0] + "\\")
-                    self.disk_label.configure(text=f"{usage.free/2**30:.1f} ГБ свободно")
+                    root = out if os.path.exists(out) else (os.path.splitdrive(out)[0] + "\\")
+                    if os.path.exists(root):
+                        usage = shutil.disk_usage(root)
+                        self.disk_label.setText(f"{usage.free/2**30:.1f} ГБ свободно")
                 except Exception:
                     pass
         except Exception:
             pass
-        self.after(2000, self._tick_status)
 
     # ---------------- manager events
     def _on_manager_event(self, ev: ProgressEvent):
@@ -387,7 +579,6 @@ class App(ctk.CTk):
                 self._handle_event(ev)
         except queue.Empty:
             pass
-        self.after(150, self._poll_ui_queue)
 
     def _handle_event(self, ev: ProgressEvent):
         if ev.kind == "log":
@@ -397,15 +588,26 @@ class App(ctk.CTk):
         elif ev.kind == "stall":
             self._append_log(f"[STALL] {ev.message}")
         elif ev.kind == "overall":
-            d = ev.overall_done or 0; t = ev.overall_total or 0
-            self.overall_label.configure(text=f"{d} / {t}")
-            self.overall_bar.set((d / t) if t else 0)
+            d = ev.overall_done or 0
+            t = ev.overall_total or 0
+            self.overall_label.setText(f"{d} / {t}")
+            self.overall_bar.setValue(int(1000 * d / t) if t else 0)
             if ev.message:
                 self._append_log(ev.message)
+            msg = ev.message or ""
+            if "завершено/остановлено" in msg and not self.manager._stop.is_set():
+                if getattr(self.settings, "auto_retry_missed_on_end", False):
+                    with self.manager._lock:
+                        has_retryable = any(tt.status in (TaskStatus.FAILED, TaskStatus.MISS) for tt in self.manager.tasks)
+                    if has_retryable and not self.manager.is_running and not self._starting:
+                        self._append_log("авто: конец списка — повтор failed/miss и запуск")
+                        QtCore.QTimer.singleShot(800, self._auto_retry_and_start)
         elif ev.kind == "scan_progress":
             data = ev.data or {}
-            cur = data.get("current", 0); tot = data.get("total", 0); sk = data.get("skipped", 0)
-            prog = (float(cur)/float(tot)) if tot else None
+            cur = data.get("current", 0)
+            tot = data.get("total", 0)
+            sk = data.get("skipped", 0)
+            prog = (float(cur) / float(tot)) if tot else None
             self._set_worker_status(0, f"сканирование: {cur}/{tot} (уже есть: {sk})", progress=prog)
             self._append_log(ev.message or f"сканирование {cur}/{tot}")
         elif ev.kind == "scan_done":
@@ -418,7 +620,6 @@ class App(ctk.CTk):
                 self._ensure_worker_labels(count)
                 self._append_log(f"активных воркеров: {count}")
             else:
-                # mark all idle
                 for wid in list(self.worker_labels.keys()):
                     self._set_worker_status(wid, "ожидание", progress=0.0)
         elif ev.kind == "worker_idle":
@@ -433,7 +634,6 @@ class App(ctk.CTk):
             prog = data.get("progress")
             status = ev.status or data.get("status") or ""
             wid = data.get("wid")
-            # find name
             name = uid
             with self.manager._lock:
                 for t in self.manager.tasks:
@@ -443,9 +643,7 @@ class App(ctk.CTk):
             if wid is not None:
                 short = phase or status or ""
                 self._set_worker_status(wid, f"{name} — {short}"[:120], progress=prog)
-            # terminal states: keep bar full, and mark idle-like text only when appropriate
             if wid is not None and status in (TaskStatus.OK.value, TaskStatus.SKIPPED.value, TaskStatus.MISS.value, TaskStatus.FAILED.value, TaskStatus.CANCELED.value):
-                # leave final phase visible briefly; worker loop will emit next task or idle
                 if prog is None:
                     self._set_worker_status(wid, f"{name} — {short}"[:120], progress=1.0)
             if status == TaskStatus.OK.value:
@@ -458,41 +656,37 @@ class App(ctk.CTk):
                                 out_file = tt.out_file or ""
                                 break
                 self._last_success_name = os.path.basename(out_file) if out_file else ""
-            # update done count periodically
             with self.manager._lock:
                 done = sum(1 for t in self.manager.tasks if t.status in (TaskStatus.OK, TaskStatus.SKIPPED, TaskStatus.MISS, TaskStatus.FAILED, TaskStatus.CANCELED))
                 total = len(self.manager.tasks)
-            self.overall_label.configure(text=f"{done} / {total}")
-            self.overall_bar.set((done/total) if total else 0)
-            # if a track became active or finished, refresh lightweight queue view (throttled)
+            self.overall_label.setText(f"{done} / {total}")
+            self.overall_bar.setValue(int(1000 * done / total) if total else 0)
             active_statuses = {TaskStatus.SEARCHING.value, TaskStatus.SELECTING.value, TaskStatus.DOWNLOADING.value, TaskStatus.CONVERTING.value, TaskStatus.TAGGING.value}
             if status == TaskStatus.OK.value or status in active_statuses or phase in ("старт",):
                 now = time.time()
-                # cheap text refresh throttled to avoid lag
                 if now - getattr(self, "_last_queue_reorder_ts", 0) > 2.0:
                     self._last_queue_reorder_ts = now
                     self._refresh_queue_view()
 
     # ---------------- actions
     def _choose_out(self):
-        d = filedialog.askdirectory(initialdir=self.out_var.get() or os.path.expanduser("~"))
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Выбрать папку сохранения", self.out_edit.text() or os.path.expanduser("~"))
         if d:
-            self.out_var.set(d)
-            if not self.queue_var.get().strip():
-                self.queue_var.set(os.path.join(d, "queue.csv"))
+            self.out_edit.setText(d)
+            if not self.queue_edit.text().strip():
+                self.queue_edit.setText(os.path.join(d, "queue.csv"))
 
     def _choose_queue_file(self):
-        initial = self.queue_var.get().strip() or os.path.join(self.out_var.get().strip() or self.settings.output_dir, "queue.csv")
-        path = filedialog.asksaveasfilename(
-            title="Выбрать или создать файл очереди (CSV)",
-            initialdir=os.path.dirname(initial) if os.path.dirname(initial) else os.path.expanduser("~"),
-            initialfile=os.path.basename(initial) or "queue.csv",
-            defaultextension=".csv",
-            filetypes=[("CSV queue", "*.csv"), ("All", "*.*")],
+        initial = self.queue_edit.text().strip() or os.path.join(self.out_edit.text().strip() or self.settings.output_dir, "queue.csv")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Выбрать или создать файл очереди (CSV)",
+            initial,
+            "CSV queue (*.csv);;All files (*.*)",
         )
         if not path:
             return
-        self.queue_var.set(path)
+        self.queue_edit.setText(path)
         self._apply_settings_from_ui()
         ensure_queue_file(self.settings.queue_file)
         self.manager.load_queue(self.settings.queue_file)
@@ -506,75 +700,24 @@ class App(ctk.CTk):
         open_path(d)
 
     def _sources_dialog(self):
-        win = ctk.CTkToplevel(self)
-        win.title("Источники поиска")
-        win.geometry("420x300")
-        vars = {}
-        cur = set(self.settings.sources or ALL_SOURCES)
-        for i, s in enumerate(ALL_SOURCES):
-            v = ctk.BooleanVar(value=s in cur)
-            vars[s] = v
-            ctk.CTkCheckBox(win, text=s, variable=v).pack(anchor="w", padx=20, pady=8)
-        def save():
-            sel = [s for s in ALL_SOURCES if vars[s].get()]
-            if not sel:
-                messagebox.showwarning("Источники", "Нужен хотя бы один источник")
-                return
-            self.settings.sources = sel
+        dlg = SourcesDialog(self, self.settings.sources or ALL_SOURCES)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            self.settings.sources = dlg.selected
             save_settings(self.settings)
             self.manager.settings = self.settings
-            win.destroy()
-        ctk.CTkButton(win, text="Сохранить", command=save).pack(pady=16)
 
     def _settings_dialog(self):
-        win = ctk.CTkToplevel(self)
-        win.title("Настройки")
-        win.geometry("520x420")
-        frm = ctk.CTkFrame(win)
-        frm.pack(fill="both", expand=True, padx=12, pady=12)
-        frm.grid_columnconfigure(1, weight=1)
-        w_var = ctk.IntVar(value=int(self.settings.workers or 3))
-        t_var = ctk.IntVar(value=int(self.settings.search_timeout_s or 80))
-        try_var = ctk.IntVar(value=int(self.settings.try_candidates or 3))
-        c_var = ctk.IntVar(value=int(self.settings.custom_bitrate_kbps or 320))
-        skip_var = ctk.BooleanVar(value=bool(self.settings.skip_existing))
-        m3u_var = ctk.BooleanVar(value=bool(self.settings.write_m3u))
-        rep_var = ctk.BooleanVar(value=bool(self.settings.write_report))
-
-        def row(r, label, widget):
-            ctk.CTkLabel(frm, text=label).grid(row=r, column=0, sticky="w", padx=8, pady=8)
-            widget.grid(row=r, column=1, sticky="ew", padx=8, pady=8)
-        row(0, "Параллельных воркеров (1-6)", ctk.CTkEntry(frm, textvariable=w_var))
-        row(1, "Таймаут поиска, сек", ctk.CTkEntry(frm, textvariable=t_var))
-        row(2, "Кандидатов пробовать на трек", ctk.CTkEntry(frm, textvariable=try_var))
-        row(3, "Свой битрейт (kbps) для custom", ctk.CTkEntry(frm, textvariable=c_var))
-        ctk.CTkCheckBox(frm, text="Пропускать уже существующие файлы", variable=skip_var).grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=8)
-        ctk.CTkCheckBox(frm, text="Писать M3U плейлист", variable=m3u_var).grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=8)
-        ctk.CTkCheckBox(frm, text="Писать CSV отчёт", variable=rep_var).grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=8)
-        def save():
-            self.settings.workers = max(1, min(6, int(w_var.get() or 3)))
-            self.settings.search_timeout_s = max(20, int(t_var.get() or 80))
-            self.settings.try_candidates = max(1, min(8, int(try_var.get() or 3)))
-            self.settings.custom_bitrate_kbps = max(64, min(320, int(c_var.get() or 320)))
-            self.settings.skip_existing = bool(skip_var.get())
-            self.settings.write_m3u = bool(m3u_var.get())
-            self.settings.write_report = bool(rep_var.get())
+        dlg = SettingsDialog(self, self.settings)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
             save_settings(self.settings)
             self.manager.settings = self.settings
-            win.destroy()
-        ctk.CTkButton(frm, text="Сохранить", command=save).grid(row=7, column=0, columnspan=2, pady=16)
 
     def _show_readme(self):
-        win = ctk.CTkToplevel(self)
-        win.title("Формат списка (README)")
-        win.geometry("640x420")
-        tb = ctk.CTkTextbox(win, wrap="word")
-        tb.pack(fill="both", expand=True, padx=10, pady=10)
-        tb.insert("1.0", README_TEXT)
-        tb.configure(state="disabled")
+        dlg = ReadmeDialog(self)
+        dlg.exec()
 
     def _import_csv(self):
-        path = filedialog.askopenfilename(title="Выбрать CSV для импорта в текущую очередь", filetypes=[("CSV", "*.csv"), ("All", "*.*")])
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Выбрать CSV для импорта в текущую очередь", "", "CSV (*.csv);;All files (*.*)")
         if not path:
             return
         self._apply_settings_from_ui()
@@ -585,19 +728,19 @@ class App(ctk.CTk):
             self._refresh_queue_view()
             self._append_log(f"импорт в текущую очередь: {len(tasks)} строк из файла, добавлено уникальных: {added}")
         except Exception as e:
-            messagebox.showerror("Импорт", str(e))
+            QtWidgets.QMessageBox.critical(self, "Импорт", str(e))
 
     def _add_to_queue(self):
         self._apply_settings_from_ui()
-        artist = self.e_artist.get().strip()
-        title = self.e_title.get().strip()
-        album = self.e_album.get().strip()
+        artist = self.e_artist.text().strip()
+        title = self.e_title.text().strip()
+        album = self.e_album.text().strip()
         try:
-            secs = int(float(self.e_secs.get().strip() or 0))
+            secs = int(float(self.e_secs.text().strip() or 0))
         except Exception:
             secs = 0
         if not artist and not title:
-            messagebox.showwarning("Добавление", "Укажите хотя бы Artist или Title")
+            QtWidgets.QMessageBox.warning(self, "Добавление", "Укажите хотя бы Artist или Title")
             return
         t = TrackTask(artist=artist, title=title, album=album, seconds=secs)
         self.manager.add_task(t, to_front=False)
@@ -607,23 +750,23 @@ class App(ctk.CTk):
 
     def _find_now(self, single: bool):
         self._apply_settings_from_ui()
-        artist = self.e_artist.get().strip()
-        title = self.e_title.get().strip()
-        album = self.e_album.get().strip()
+        artist = self.e_artist.text().strip()
+        title = self.e_title.text().strip()
+        album = self.e_album.text().strip()
         try:
-            secs = int(float(self.e_secs.get().strip() or 0))
+            secs = int(float(self.e_secs.text().strip() or 0))
         except Exception:
             secs = 0
         if not artist and not title:
-            messagebox.showwarning("Поиск", "Укажите хотя бы Artist или Title")
+            QtWidgets.QMessageBox.warning(self, "Поиск", "Укажите хотя бы Artist или Title")
             return
         t = TrackTask(artist=artist, title=title, album=album, seconds=secs)
-        # add to front if not exists, and run priority
         with self.manager._lock:
             existing = None
             for x in self.manager.tasks:
                 if norm_text(x.artist) == norm_text(artist) and norm_text(x.title) == norm_text(title):
-                    existing = x; break
+                    existing = x
+                    break
             if not existing:
                 self.manager.tasks.insert(0, t)
                 self.manager._total_count = len(self.manager.tasks)
@@ -640,18 +783,16 @@ class App(ctk.CTk):
 
     def _start(self):
         self._apply_settings_from_ui()
-        # load from file only if queue not loaded yet; avoid resetting statuses/progress
         if not self.manager.tasks:
             self.manager.load_queue(self.settings.queue_file)
             self._refresh_queue_view()
         if not self.manager.tasks:
-            messagebox.showinfo("Старт", "Очередь пуста. Импортируйте CSV или добавьте треки.")
+            QtWidgets.QMessageBox.information(self, "Старт", "Очередь пуста. Импортируйте CSV или добавьте треки.")
             return
-        # if everything already done, inform user
         if all(t.status in (TaskStatus.OK, TaskStatus.SKIPPED, TaskStatus.MISS, TaskStatus.FAILED, TaskStatus.CANCELED) for t in self.manager.tasks):
-            messagebox.showinfo("Старт", "Все задачи уже обработаны. Используйте «Повторить failed/miss» для повторной попытки нужных треков.")
+            QtWidgets.QMessageBox.information(self, "Старт", "Все задачи уже обработаны. Используйте «Повторить failed/miss» для повторной попытки нужных треков.")
             return
-        if self.manager.is_running or getattr(self, "_starting", False):
+        if self.manager.is_running or self._starting:
             return
         self._starting = True
         n = max(1, min(int(self.settings.workers or 1), 6))
@@ -666,7 +807,6 @@ class App(ctk.CTk):
                 self.manager.prescan_existing(progress_cb=prescan_progress)
                 self.ui_queue.put(ProgressEvent(kind="log", message="сканирование завершено, запуск загрузки..."))
                 self.ui_queue.put(ProgressEvent(kind="scan_done", message="done"))
-                # refresh queue view after scan
                 self.ui_queue.put(ProgressEvent(kind="refresh_queue"))
             except Exception as e:
                 self.ui_queue.put(ProgressEvent(kind="log", message=f"ошибка сканирования: {e}"))
@@ -697,13 +837,26 @@ class App(ctk.CTk):
                     t.progress = 0.0
                     t.phase = ""
                     n += 1
-            # adjust done count so overall progress reflects pending retries
             self.manager._done_count = sum(1 for t in self.manager.tasks if t.status in (TaskStatus.OK, TaskStatus.SKIPPED, TaskStatus.MISS, TaskStatus.FAILED, TaskStatus.CANCELED))
         self._refresh_queue_view()
         self._append_log(f"сброшено для повтора: {n}")
 
+    def _auto_retry_and_start(self):
+        try:
+            if not getattr(self.settings, "auto_retry_missed_on_end", False):
+                return
+            if self.manager.is_running or self._starting:
+                return
+            with self.manager._lock:
+                has_retryable = any(t.status in (TaskStatus.FAILED, TaskStatus.MISS) for t in self.manager.tasks)
+            if not has_retryable:
+                return
+            self._retry_failed()
+            self._start()
+        except Exception as e:
+            self._append_log(f"ошибка авто-повтора: {e}")
+
     def _open_log(self):
-        # main app log + jobs results
         candidates = [
             os.path.join(self.settings.output_dir, "_jobs", "results.jsonl"),
             os.path.join(self.settings.output_dir, "app.log"),
@@ -712,15 +865,12 @@ class App(ctk.CTk):
             if os.path.exists(p):
                 open_path(p)
                 return
-        # create placeholder
         p = os.path.join(self.settings.output_dir, "app.log")
         os.makedirs(os.path.dirname(p), exist_ok=True)
         if not os.path.exists(p):
             with open(p, "w", encoding="utf-8") as f:
                 f.write("")
         open_path(p)
-
-    # (playback/open-track functions removed by request)
 
     def _export_report(self):
         self._apply_settings_from_ui()
@@ -732,9 +882,9 @@ class App(ctk.CTk):
             tasks = list(self.manager.tasks)
         with open(rep, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["Artist","Title","Album","Seconds","Status","Source","Quality","Match","DurDelta_s","OutFile","Note"])
+            w.writerow(["Artist", "Title", "Album", "Seconds", "Status", "Source", "Quality", "Match", "DurDelta_s", "OutFile", "Note"])
             for t in tasks:
-                w.writerow([t.artist,t.title,t.album,t.seconds,t.status.value,t.source,t.quality_label,t.match,t.dur_delta_s,t.out_file,t.note])
+                w.writerow([t.artist, t.title, t.album, t.seconds, t.status.value, t.source, t.quality_label, t.match, t.dur_delta_s, t.out_file, t.note])
         if self.settings.write_m3u:
             lines = ["#EXTM3U"]
             for t in tasks:
@@ -744,28 +894,31 @@ class App(ctk.CTk):
             with open(m3u, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
         self._append_log(f"экспорт: {rep}" + (f", {m3u}" if self.settings.write_m3u else ""))
-        messagebox.showinfo("Экспорт", f"Сохранено:\n{rep}" + (f"\n{m3u}" if self.settings.write_m3u else ""))
+        QtWidgets.QMessageBox.information(self, "Экспорт", f"Сохранено:\n{rep}" + (f"\n{m3u}" if self.settings.write_m3u else ""))
 
-    def _on_close(self):
+    def closeEvent(self, event: QtGui.QCloseEvent):
         try:
             self._apply_settings_from_ui()
             self.manager.save_queue(self.settings.queue_file)
             self.manager.stop()
         except Exception:
             pass
-        self.destroy()
+        event.accept()
 
 
-def open_path(path: str):
-    try:
-        if sys.platform.startswith("win"):
-            os.startfile(path)  # type: ignore
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", path])
-        else:
-            subprocess.Popen(["xdg-open", path])
-    except Exception:
-        try:
-            webbrowser.open(path)
-        except Exception:
-            pass
+class App:
+    """Compatibility wrapper so existing entrypoints (launcher/app.main) keep working."""
+    def __init__(self):
+        self._app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+        self._app.setStyle("Fusion")
+        self._app.setStyleSheet(DARK_QSS)
+        self._win = MainWindow()
+
+    def mainloop(self):
+        self._win.show()
+        self._app.exec()
+
+
+def main():
+    app = App()
+    app.mainloop()
